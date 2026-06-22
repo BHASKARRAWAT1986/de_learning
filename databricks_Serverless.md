@@ -1,4 +1,4 @@
-# Decision Record: Adopt Databricks Private Network Gateway (PNG) on Azure for Serverless Private Connectivity
+# Decision Record:Databricks Private Network Gateway (PNG) on Azure for Serverless Private Connectivity
 
 # 🧭 Context and Problem Statement
 
@@ -65,33 +65,11 @@ According to the Databricks PNG Private Preview documentation:
 
 ## Upfront costs
 
-Although the feature itself has no preview charge, adoption involves implementation effort, including:
-
-- Azure network preparation for a dedicated delegated subnet
-- Databricks account administration to create NCCs and PNG resources
-- DNS resolver configuration and validation
-- Workspace attachment and environment validation
-- Testing of connectivity, routing, and firewall behavior
-
-## Ongoing costs
-
-Ongoing operational effort includes:
-
-- managing gateway lifecycle and status checks
-- maintaining DNS resolver and Private DNS Zone configuration
-- maintaining subnet, NSG, firewall, and routing consistency
-- validating routing behavior for workloads that depend on PNG
-- coordinating with Databricks account teams during the preview period
+Although the feature itself has no preview charge, adoption involves implementation effort.
 
 ## Cost uncertainty
 
-Future direct pricing is not yet published. In addition, infrastructure-related operational costs may vary depending on:
-
-- number of deployed gateways
-- number of regions and workspaces
-- DNS architecture
-- firewall or appliance usage
-- amount of traffic routed through customer-managed infrastructure
+Future direct pricing is not yet published. 
 
 # 🛡️ Threat Considerations
 
