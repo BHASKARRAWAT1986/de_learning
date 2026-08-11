@@ -1,0 +1,1551 @@
+# Real-Time CDC Pipeline: MySQL → Debezium → Kafka → Databricks DLT (Bronze/Silver)
+## End-to-End FAANG Interview Guide
+
+---
+
+## 1. Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         FULL PIPELINE ARCHITECTURE                              │
+│                                                                                 │
+│  ┌──────────────┐    ┌──────────────┐    ┌─────────────┐    ┌───────────────┐  │
+│  │   MySQL DB   │    │   Debezium   │    │    Kafka    │    │  Databricks   │  │
+│  │              │    │  (Connector) │    │   Cluster   │    │     DLT       │  │
+│  │  - binlog    │───▶│  - reads     │───▶│  - Topic:   │───▶│  - Bronze     │  │
+│  │    enabled   │    │    binlog    │    │    orders   │    │  - Silver     │  │
+│  │  - tables:   │    │  - captures  │    │  - Topic:   │    │  - Autoloader │  │
+│  │    orders    │    │    INSERT    │    │    users    │    │  - MERGE INTO │  │
+│  │    users     │    │    UPDATE    │    │  - Topic:   │    │  - Quarantine │  │
+│  │    products  │    │    DELETE    │    │    products │    └───────────────┘  │
+│  └──────────────┘    └──────────────┘    └─────────────┘                       │
+│                                                                                 │
+│  SOURCE LAYER          CDC LAYER           TRANSPORT          LAKEHOUSE         │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow in Plain English
+1. **MySQL** has binary logging (`binlog`) enabled — every INSERT/UPDATE/DELETE is recorded
+2. **Debezium** reads that binlog stream, converts each change event into a **structured JSON message**
+3. **Kafka** acts as the durable, scalable buffer — one topic per source table
+4. **Databricks Structured Streaming** (via DLT) consumes Kafka topics
+5. **Bronze layer** — raw CDC events land exactly as received (append-only)
+6. **Silver layer** — deduplicated, merged, business-ready records (current state)
+
+---
+
+## 2. Component Deep Dive
+
+### 2.1 MySQL Binary Log (Binlog)
+
+The binlog is MySQL's internal write-ahead log. It records every data modification in order.
+
+```sql
+-- Enable binlog on MySQL (requires server restart or config change)
+-- my.cnf:
+[mysqld]
+server-id         = 1
+log_bin           = /var/lib/mysql/mysql-bin.log
+binlog_format     = ROW          -- MUST be ROW for Debezium (not STATEMENT or MIXED)
+binlog_row_image  = FULL         -- Capture before AND after image of every row change
+expire_logs_days  = 7            -- Retention: 7 days of binlog history
+
+-- Verify binlog is running
+SHOW VARIABLES LIKE 'log_bin';
+SHOW VARIABLES LIKE 'binlog_format';
+SHOW MASTER STATUS;              -- Current binlog position
+```
+
+**Why ROW format?**  
+`ROW` format captures the actual **before and after values** of changed rows.  
+`STATEMENT` format only logs the SQL statement — Debezium cannot reliably derive row-level changes from it.
+
+### 2.2 Debezium MySQL Connector
+
+Debezium is an open-source **CDC (Change Data Capture)** framework.  
+It runs as a Kafka Connect plugin and operates in two phases:
+
+#### Phase 1: Initial Snapshot (Full Load)
+```json
+// Debezium connector config (deployed to Kafka Connect)
+{
+  "name": "mysql-orders-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "database.hostname": "mysql-prod.internal",
+    "database.port": "3306",
+    "database.user": "debezium_user",
+    "database.password": "***",
+    "database.server.id": "184054",
+    "database.server.name": "prod_mysql",
+    "database.include.list": "ecommerce",
+    "table.include.list": "ecommerce.orders,ecommerce.users,ecommerce.products",
+    "snapshot.mode": "initial",           // Snapshot existing data first, then stream
+    "snapshot.locking.mode": "minimal",   // Minimal table lock during snapshot
+    "include.schema.changes": "true",     // Capture DDL changes too
+    "tombstones.on.delete": "true",       // Emit tombstone on DELETE
+    "decimal.handling.mode": "string",    // Avoid Kafka decimal precision issues
+    "time.precision.mode": "adaptive_time_microseconds",
+    "database.history.kafka.topic": "schema-changes.ecommerce",  // DDL history topic
+    "database.history.kafka.bootstrap.servers": "kafka:9092",
+    "transforms": "route",
+    "transforms.route.type": "org.apache.kafka.connect.transforms.ReplaceField$Value",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter"
+  }
+}
+```
+
+#### Phase 2: Ongoing CDC Stream (Binlog Tailing)
+```
+Debezium reads binlog continuously:
+  Binlog position: mysql-bin.000042 offset 1048576
+  Reads next event: UPDATE orders SET status='SHIPPED' WHERE id=100
+  
+  Emits Kafka message to topic: prod_mysql.ecommerce.orders
+```
+
+### 2.3 Kafka Message Structure (Debezium CDC Event)
+
+Every change event emitted by Debezium has this structure:
+
+```json
+{
+  "schema": { ... },   // Avro/JSON schema definition (can be stripped in production)
+  "payload": {
+    "before": {        // Row state BEFORE the change (null for INSERT)
+      "id": 100,
+      "status": "PENDING",
+      "amount": 150.00,
+      "updated_at": 1716825600000
+    },
+    "after": {         // Row state AFTER the change (null for DELETE)
+      "id": 100,
+      "status": "SHIPPED",
+      "amount": 150.00,
+      "updated_at": 1716912000000
+    },
+    "source": {
+      "version": "2.5.0.Final",
+      "connector": "mysql",
+      "name": "prod_mysql",
+      "ts_ms": 1716912000000,    // Timestamp of the change in MySQL
+      "db": "ecommerce",
+      "table": "orders",
+      "server_id": 184054,
+      "file": "mysql-bin.000042",  // Binlog file
+      "pos": 1048576,              // Binlog offset (critical for exactly-once)
+      "row": 0,
+      "snapshot": "false"          // "true" during initial snapshot
+    },
+    "op": "u",           // Operation: c=create, u=update, d=delete, r=read(snapshot)
+    "ts_ms": 1716912001234,  // Timestamp Debezium emitted this event
+    "transaction": null
+  }
+}
+```
+
+#### Operation Types
+| `op` value | Meaning | `before` | `after` |
+|---|---|---|---|
+| `c` | CREATE (INSERT) | null | full row |
+| `u` | UPDATE | old values | new values |
+| `d` | DELETE | old values | null |
+| `r` | READ (snapshot) | null | full row |
+
+---
+
+## 3. Kafka Setup
+
+```
+Topics created (one per source table):
+  prod_mysql.ecommerce.orders    → 8 partitions (high volume)
+  prod_mysql.ecommerce.users     → 4 partitions
+  prod_mysql.ecommerce.products  → 2 partitions (low volume)
+
+Kafka topic config:
+  retention.ms        = 604800000     // 7 days retention
+  retention.bytes     = 107374182400  // 100GB max per topic
+  cleanup.policy      = delete        // Not compacted (DLT handles dedup)
+  replication.factor  = 3             // HA across 3 Kafka brokers
+```
+
+**Why not use Kafka log compaction?**  
+Log compaction keeps only the latest value per key — but we need ALL change events in Bronze (for audit trail). DLT Silver handles the "latest state" materialisation.
+
+---
+
+## 4. Databricks DLT Pipeline
+
+### 4.1 Pipeline Architecture
+
+```
+Kafka Topics
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DLT PIPELINE                                      │
+│                                                                      │
+│  ┌─────────────────────────────┐                                    │
+│  │  BRONZE LAYER (Streaming)   │  ← raw CDC events, append-only    │
+│  │  bronze_orders_raw          │    no transformation               │
+│  │  bronze_users_raw           │    Parquet + Delta                 │
+│  │  bronze_products_raw        │    quarantine bad records          │
+│  └──────────────┬──────────────┘                                    │
+│                 │                                                    │
+│  ┌──────────────▼──────────────┐                                    │
+│  │  SILVER LAYER (Streaming)   │  ← deduplicated, merged           │
+│  │  silver_orders              │    APPLY CHANGES INTO (SCD Type 1) │
+│  │  silver_users               │    current state of source tables  │
+│  │  silver_products            │    business rules applied          │
+│  └─────────────────────────────┘                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 Bronze Layer DLT Definition
+
+```python
+import dlt
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, LongType
+
+# ─────────────────────────────────────────────────────────────────
+# BRONZE: Raw CDC events from Kafka — append-only, no transformation
+# ─────────────────────────────────────────────────────────────────
+
+KAFKA_BOOTSTRAP = spark.conf.get("kafka.bootstrap.servers")  # from DLT config
+
+@dlt.table(
+    name="bronze_orders_raw",
+    comment="Raw CDC events from MySQL orders table via Debezium/Kafka",
+    table_properties={
+        "delta.autoOptimize.optimizeWrite": "true",
+        "delta.autoOptimize.autoCompact": "true",
+        "pipelines.reset.allowed": "false"  # Never truncate bronze — it's the audit trail
+    }
+)
+@dlt.expect_or_drop("valid_kafka_value", "value IS NOT NULL")
+def bronze_orders_raw():
+    return (
+        spark.readStream
+            .format("kafka")
+            .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+            .option("subscribe", "prod_mysql.ecommerce.orders")
+            .option("startingOffsets", "latest")        # or "earliest" for backfill
+            .option("maxOffsetsPerTrigger", "100000")   # flow control
+            .option("kafka.security.protocol", "SASL_SSL")
+            .option("kafka.sasl.mechanism", "PLAIN")
+            .option("kafka.sasl.jaas.config", spark.conf.get("kafka.sasl.jaas"))
+            .load()
+            # Keep raw Kafka metadata alongside payload
+            .select(
+                F.col("topic"),
+                F.col("partition"),
+                F.col("offset"),
+                F.col("timestamp").alias("kafka_timestamp"),
+                F.col("value").cast("string").alias("raw_payload"),   # keep raw JSON
+                # Parse the Debezium payload
+                F.get_json_object(F.col("value").cast("string"), "$.payload.op")
+                    .alias("cdc_op"),
+                F.get_json_object(F.col("value").cast("string"), "$.payload.ts_ms")
+                    .cast("long").alias("cdc_ts_ms"),
+                F.get_json_object(F.col("value").cast("string"), "$.payload.source.file")
+                    .alias("binlog_file"),
+                F.get_json_object(F.col("value").cast("string"), "$.payload.source.pos")
+                    .cast("long").alias("binlog_pos"),
+                # Extract the 'after' image (current state of row)
+                F.get_json_object(F.col("value").cast("string"), "$.payload.after.id")
+                    .cast("long").alias("order_id"),
+                F.get_json_object(F.col("value").cast("string"), "$.payload.after.status")
+                    .alias("status"),
+                F.get_json_object(F.col("value").cast("string"), "$.payload.after.amount")
+                    .cast("double").alias("amount"),
+                F.get_json_object(F.col("value").cast("string"), "$.payload.after.customer_id")
+                    .cast("long").alias("customer_id"),
+                F.get_json_object(F.col("value").cast("string"), "$.payload.after.updated_at")
+                    .cast("long").alias("source_updated_at_ms"),
+                # Ingestion metadata
+                F.current_timestamp().alias("ingested_at"),
+                F.lit("kafka_debezium").alias("source_system")
+            )
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# BRONZE QUARANTINE: Bad/unparseable records go here — never lost
+# ─────────────────────────────────────────────────────────────────
+
+@dlt.table(
+    name="bronze_orders_quarantine",
+    comment="Malformed or unparseable CDC events — manual review required"
+)
+@dlt.expect_or_drop("is_quarantine_record", "cdc_op IS NULL OR order_id IS NULL")
+def bronze_orders_quarantine():
+    return (
+        spark.readStream
+            .format("kafka")
+            .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+            .option("subscribe", "prod_mysql.ecommerce.orders")
+            .option("startingOffsets", "latest")
+            .load()
+            .select(
+                F.col("value").cast("string").alias("raw_payload"),
+                F.get_json_object(F.col("value").cast("string"), "$.payload.op").alias("cdc_op"),
+                F.get_json_object(F.col("value").cast("string"), "$.payload.after.id")
+                    .cast("long").alias("order_id"),
+                F.current_timestamp().alias("quarantined_at"),
+                F.lit("parse_failure").alias("quarantine_reason")
+            )
+            .filter("cdc_op IS NULL OR order_id IS NULL")   # only bad records
+    )
+```
+
+### 4.3 Silver Layer DLT — APPLY CHANGES INTO (CDC-native)
+
+This is the **most important part** — DLT's `APPLY CHANGES INTO` handles CDC semantics natively.
+
+```python
+# ─────────────────────────────────────────────────────────────────
+# SILVER: Current state of orders table — SCD Type 1 (latest wins)
+# Uses DLT's APPLY CHANGES INTO which handles:
+#   - Out-of-order events (using sequence_by)
+#   - INSERT/UPDATE/DELETE operations
+#   - Exactly-once upsert semantics
+# ─────────────────────────────────────────────────────────────────
+
+dlt.create_streaming_table(
+    name="silver_orders",
+    comment="Current state of orders — deduplicated, merged from CDC stream",
+    table_properties={
+        "delta.enableDeletionVectors": "true",
+        "delta.autoOptimize.optimizeWrite": "true",
+        "pipelines.autoOptimize.managed": "true"
+    },
+    # Data quality expectations
+    expect_all_or_drop={
+        "valid_order_id":  "order_id IS NOT NULL",
+        "valid_amount":    "amount >= 0",
+        "valid_status":    "status IN ('PENDING','PROCESSING','SHIPPED','DELIVERED','CANCELLED')"
+    }
+)
+
+dlt.apply_changes(
+    target         = "silver_orders",
+    source         = "bronze_orders_raw",
+    keys           = ["order_id"],              # Primary key from MySQL
+    sequence_by    = F.col("cdc_ts_ms"),        # Use MySQL change timestamp to order events
+    ignore_null_updates = False,                # Apply NULL values too
+    apply_as_deletes = F.expr("cdc_op = 'd'"),  # Treat op='d' events as deletes
+    apply_as_truncates = F.expr("cdc_op = 't'"),# Handle TRUNCATE events
+    column_list    = [
+        "order_id", "customer_id", "status", "amount",
+        "source_updated_at_ms", "ingested_at"
+    ],
+    # SCD Type 1: overwrite previous values (no history kept in silver)
+    # For SCD Type 2 use: stored_as_scd_type="2"
+    stored_as_scd_type = "1"
+)
+```
+
+**Why `sequence_by = cdc_ts_ms`?**  
+Kafka does not guarantee strict ordering across partitions. If UPDATE event arrives before INSERT (network reorder), `sequence_by` ensures the lower-timestamp event is ignored — the row always reflects the chronologically latest state.
+
+### 4.4 Handling DELETE Events in Silver
+
+```python
+# Option A: Hard deletes (physically remove row from silver)
+# (default behavior in APPLY CHANGES with apply_as_deletes)
+
+# Option B: Soft deletes (mark as deleted, keep the row)
+dlt.apply_changes(
+    target      = "silver_orders",
+    source      = "bronze_orders_raw",
+    keys        = ["order_id"],
+    sequence_by = F.col("cdc_ts_ms"),
+    apply_as_deletes  = F.expr("cdc_op = 'd'"),
+    # Override: instead of deleting, set is_deleted=true
+    # This is done by adding the flag in bronze before silver reads it
+)
+
+# Better pattern: enrich bronze with soft-delete flag, silver inherits it
+# In bronze transformation:
+.withColumn("is_deleted", F.when(F.col("cdc_op") == "d", True).otherwise(False))
+.withColumn("is_active",  F.when(F.col("cdc_op") != "d", True).otherwise(False))
+```
+
+### 4.5 DLT Pipeline Configuration (YAML)
+
+```yaml
+# databricks.yml / DLT pipeline settings
+pipeline:
+  name: "mysql-cdc-to-lakehouse"
+  catalog: "prod_catalog"
+  schema: "ecommerce"
+  
+  clusters:
+    - label: "default"
+      autoscale:
+        min_workers: 2
+        max_workers: 8
+        mode: "ENHANCED"          # Enhanced autoscaling for streaming
+  
+  configuration:
+    kafka.bootstrap.servers: "broker1:9092,broker2:9092,broker3:9092"
+    kafka.sasl.jaas: "{{secrets/kafka/sasl_jaas}}"  # Databricks Secret
+    pipelines.trigger.interval: "30 seconds"         # micro-batch interval
+  
+  continuous: false   # triggered mode (vs continuous for sub-second latency)
+  development: false
+  
+  photon: true        # Enable Photon for faster scan/merge
+  
+  notifications:
+    - email_recipients: ["data-eng@company.com"]
+      alerts:
+        - on_update_failure
+        - on_flow_failure
+```
+
+---
+
+## 5. Schema Evolution Handling
+
+One of the most common real-world issues — source MySQL schema changes must not break the pipeline.
+
+```python
+# DLT handles schema evolution via table properties
+@dlt.table(
+    name="bronze_orders_raw",
+    table_properties={
+        "delta.columnMapping.mode": "name",  # Name-based column mapping
+        "delta.minReaderVersion": "2",
+        "delta.minWriterVersion": "5"
+    }
+)
+def bronze_orders_raw():
+    return (
+        spark.readStream
+            .format("kafka")
+            ...
+            .load()
+            # Use schema inference with mergeSchema
+            .option("mergeSchema", "true")  # auto-adapt to new columns
+    )
+```
+
+**How schema changes propagate:**
+```
+MySQL: ALTER TABLE orders ADD COLUMN discount DOUBLE DEFAULT 0;
+  ↓
+Debezium: emits new event with discount field
+  ↓
+Debezium schema-changes topic: records the DDL change
+  ↓
+Kafka: new messages include discount field
+  ↓
+Bronze: DLT detects new column → evolves schema automatically (mergeSchema)
+  ↓
+Silver: APPLY CHANGES INTO applies new column to silver table
+```
+
+---
+
+## 6. Pros and Cons
+
+### Pros
+| Area | Benefit |
+|---|---|
+| **Latency** | Near real-time (seconds to 1 minute end-to-end) |
+| **No source impact** | Debezium reads binlog — zero load on MySQL queries |
+| **Full audit trail** | Bronze preserves every CDC event forever |
+| **Exactly-once** | DLT APPLY CHANGES handles duplicate events via sequence_by |
+| **Schema evolution** | DLT + Delta handle MySQL DDL changes gracefully |
+| **Scalability** | Kafka decouples source from sink — spike absorption |
+| **Replay** | Kafka retention allows re-reading historical events for recovery |
+| **Operational simplicity** | DLT manages checkpoints, retries, schema automatically |
+| **DELETE semantics** | Debezium captures hard deletes — rare in traditional ETL |
+| **GDPR compliance** | Hard deletes in silver + bronze soft-delete flag |
+
+### Cons
+| Area | Limitation |
+|---|---|
+| **Operational complexity** | 4 separate systems to maintain (MySQL, Debezium, Kafka, Databricks) |
+| **Initial snapshot cost** | Full table snapshot locks MySQL briefly; large tables take hours |
+| **Schema coupling** | Debezium schema registry must stay in sync with MySQL schema |
+| **Binlog retention** | If Debezium connector is down > binlog retention period → full re-snapshot needed |
+| **Out-of-order events** | Kafka partition ordering guarantees not global — sequence_by is essential |
+| **DELETE complexity** | Hard deletes require careful handling to avoid losing data in bronze |
+| **Cost** | Kafka cluster + Debezium Connect cluster + Databricks compute = significant cost |
+| **Latency floor** | Micro-batch mode = 30-60 second latency; continuous mode is expensive |
+| **Debugging difficulty** | Tracing a single row through 4 systems is non-trivial |
+
+---
+
+## 7. Trade-offs & Design Decisions
+
+### Trade-off 1: Kafka Topic-per-Table vs Single Topic
+
+| | Topic-per-Table | Single Topic |
+|---|---|---|
+| Parallelism | Independent scaling per table | One consumer group for all |
+| Consumer isolation | Yes (DLT stream per topic) | No |
+| Backpressure | Isolated per table | One slow table blocks others |
+| Operational complexity | More topics to manage | Simpler |
+| **Chosen** | **Topic-per-table** | |
+| **Reason** | Orders volume is 100x users volume — isolation prevents starvation |
+
+### Trade-off 2: APPLY CHANGES (SCD1) vs SCD Type 2
+
+| | SCD Type 1 | SCD Type 2 |
+|---|---|---|
+| Storage | Less (only current row) | More (all historical rows) |
+| Query simplicity | Simple (no filter needed) | Needs `WHERE is_current=true` |
+| Historical analysis | Not possible in silver | Fully supported |
+| CDC latency | Lower (simple MERGE) | Higher (insert + expire row) |
+| **Chosen** | **SCD Type 1 for silver** | SCD Type 2 for gold (if needed) |
+| **Reason** | Silver = current state for dashboards; Gold = history for analytics |
+
+### Trade-off 3: Continuous Streaming vs Triggered Micro-batch
+
+| | Continuous | Triggered (30s interval) |
+|---|---|---|
+| Latency | Sub-second | 30-60 seconds |
+| Cost | High (always-on compute) | Low (scales down between batches) |
+| Stability | More complex failure modes | Well-understood checkpointing |
+| **Chosen** | **Triggered (30s)** | |
+| **Reason** | Business SLA = 2 minutes; 30s satisfies requirement at 70% lower cost |
+
+### Trade-off 4: Kafka JSON vs Avro with Schema Registry
+
+| | JSON | Avro + Schema Registry |
+|---|---|---|
+| Schema enforcement | None | Strict (fail on schema mismatch) |
+| Message size | Larger (verbose) | Smaller (binary) |
+| Complexity | Simple | Needs Schema Registry service |
+| Evolution safety | Manual | Automatic with compatibility checks |
+| **Chosen** | **Avro + Schema Registry** for production | JSON for dev |
+| **Reason** | Schema drift is the #1 cause of pipeline failures; enforce at ingest |
+
+---
+
+## 8. Common Hiccups & How to Solve Them
+
+### Hiccup 1: Debezium Loses Binlog Position (Offset Expiry)
+```
+Problem:  Debezium connector is down for 8 days.
+          MySQL binlog retention = 7 days.
+          When connector restarts → binlog position no longer exists.
+          Error: "Could not find first log file name in binary log index file"
+
+Solution:
+  1. Increase MySQL binlog retention to 14+ days
+     SET GLOBAL expire_logs_days = 14;
+  
+  2. In connector config: snapshot.mode = "when_needed"
+     → Debezium auto-detects offset expiry and re-snapshots
+  
+  3. Alert on connector lag > 6 days (before expiry)
+     Monitor: kafka.consumer.group.lag metric in Grafana
+```
+
+### Hiccup 2: Out-of-Order CDC Events Corrupting Silver
+```
+Problem:  Network reorder causes:
+            t=1: UPDATE order 100 status=SHIPPED  (arrives second)
+            t=2: UPDATE order 100 status=DELIVERED (arrives FIRST)
+          Silver shows SHIPPED (wrong! should be DELIVERED)
+
+Solution: 
+  sequence_by = F.col("cdc_ts_ms")
+  DLT APPLY CHANGES ignores events with lower sequence than the current state.
+  The DELIVERED event (t=2) wins → correct final state.
+```
+
+### Hiccup 3: Initial Snapshot + Ongoing Events Race Condition
+```
+Problem:  Debezium snapshots 10M rows at t=0.
+          At t=0.5s: customer updates their order (CDC event)
+          At t=1s: snapshot reaches that row (stale value)
+          Bronze has: [stale_snapshot_value] then [correct_update]
+          Silver: APPLY CHANGES with sequence_by handles this correctly.
+          
+Solution:
+  - sequence_by on cdc_ts_ms: snapshot events have ts from MySQL,
+    the update has a later ts → update wins in silver.
+  - snapshot.mode = "initial_only" then switch to "never" 
+    for production after snapshot completes.
+```
+
+### Hiccup 4: Large BLOB / TEXT Columns Causing Kafka Message Size Errors
+```
+Problem:  MySQL orders table has a JSON blob column (order_details, 2MB)
+          Kafka default max.message.bytes = 1MB
+          Error: "RecordTooLargeException"
+
+Solutions:
+  1. Increase Kafka: max.message.bytes = 10485760 (10MB) on the topic
+     AND producer.max.request.size = 10485760
+
+  2. In Debezium: exclude the large column
+     "column.exclude.list": "ecommerce.orders.order_details"
+     Store blobs in object storage instead (S3/ADLS), reference by key.
+
+  3. Use column.mask.hash in Debezium for PII columns too.
+```
+
+### Hiccup 5: DLT Checkpoint Corruption on Pipeline Restart
+```
+Problem:  DLT pipeline fails mid-run. 
+          On restart: checkpoint state is inconsistent.
+          Error: "Invalid checkpoint state"
+
+Solution:
+  1. Full refresh (USE SPARINGLY — re-reads from earliest Kafka offset)
+     DLT UI → Full Refresh
+  
+  2. Better: store checkpoint in reliable ADLS/S3, not ephemeral storage
+     spark.conf.set("spark.databricks.delta.streaming.checkpointFileManagerClass",
+                    "io.delta.storage.S3SingleDriverLogStore")
+  
+  3. Keep Kafka retention ≥ checkpoint age + buffer for safe replay.
+```
+
+### Hiccup 6: Silver Table Lock Contention During MERGE
+```
+Problem:  APPLY CHANGES runs MERGE on silver_orders.
+          Simultaneously, a Gold layer job reads silver_orders.
+          Delta MERGE takes a table write lock → Gold job slows.
+
+Solution:
+  1. Enable Deletion Vectors on silver_orders (reduces MERGE write amplification)
+     ALTER TABLE silver_orders SET TBLPROPERTIES (
+       'delta.enableDeletionVectors' = 'true'
+     );
+  
+  2. Use Delta's concurrent read/write (MVCC):
+     Readers use snapshot isolation → never blocked by writers.
+     Only writer-writer contention is a concern.
+  
+  3. Stagger Gold refresh trigger after Silver commit.
+```
+
+### Hiccup 7: PII Data / GDPR Right-to-be-Forgotten
+```
+Problem:  Customer requests data deletion.
+          GDPR requires deleting from ALL storage.
+          Bronze has historical CDC events with customer PII — can't MERGE.
+
+Solution:
+  Bronze: Replace PII columns with NULL/hash BEFORE writing to Delta:
+    .withColumn("customer_email", F.sha2(F.col("customer_email"), 256))
+    .withColumn("customer_phone", F.lit(None))
+  
+  Or: Keep PII in a separate encrypted "vault" table;
+      Bronze stores a reference key, not the raw PII.
+  
+  Silver: Hard delete runs normally.
+  Bronze: Periodic REPLACE INTO for GDPR deletes (write new file, VACUUM old).
+```
+
+---
+
+## 9. STAR Format Answers for FAANG
+
+---
+
+### STAR #1: "Tell me about a real-time data pipeline you built"
+
+**Situation:**  
+We had a core MySQL e-commerce database (orders, users, products) serving our transactional application. Our analytics team was running heavy `SELECT` queries directly on MySQL, causing query timeouts in production during peak hours. The business needed near-real-time dashboards with a <2 minute SLA.
+
+**Task:**  
+Design and implement a real-time CDC pipeline that replicates MySQL to a Databricks Delta Lakehouse with zero impact on the production MySQL database, maintaining exactly-once delivery and supporting schema evolution.
+
+**Action:**  
+1. Enabled MySQL ROW-format binary logging with FULL row image for complete before/after capture
+2. Deployed Debezium MySQL Connector on Kafka Connect cluster — reads binlog, emits structured JSON events to Kafka (one topic per table, 8 partitions for orders)
+3. Built DLT pipeline with two layers:
+   - **Bronze**: Streaming ingest from Kafka, parse Debezium envelope, store raw CDC events append-only — immutable audit trail, no business logic
+   - **Silver**: Used DLT `APPLY CHANGES INTO` with `sequence_by = cdc_ts_ms` to handle out-of-order events and SCD Type 1 MERGE — gives current state of source tables
+4. Implemented data quality via DLT expectations — malformed records routed to quarantine table, never dropped
+5. Configured 30-second trigger intervals with Kafka offset checkpointing for recovery
+6. Solved GDPR compliance by hashing PII at Bronze ingestion — no raw PII in the lakehouse
+
+**Result:**  
+- End-to-end latency: **45 seconds** (well within 2-minute SLA)
+- MySQL production query load dropped **by 94%** — analytics fully moved to lakehouse
+- Successfully handled a schema change (new column added to orders) with **zero pipeline downtime** via Delta schema evolution
+- Processed **2.5 million CDC events/day** with 99.97% delivery accuracy
+
+---
+
+### STAR #2: "Describe a time you solved a critical data pipeline failure"
+
+**Situation:**  
+Our Debezium connector had a silent failure over a weekend. By Monday morning, it had been down for 56 hours. MySQL binlog retention was 48 hours. The connector's saved binlog position no longer existed — we had a **binlog gap of 8 hours** of data.
+
+**Task:**  
+Recover the pipeline, fill the data gap, and implement safeguards to prevent recurrence — all while the downstream Silver tables were serving live dashboards.
+
+**Action:**  
+1. **Immediate triage**: Identified the gap window using the last Kafka message timestamp and MySQL binlog history. 8 hours of transactions were missing.
+2. **Gap fill**: Ran a targeted batch extract from MySQL using JDBC for the 8-hour window (MySQL had the data — only the binlog was gone), formatted it as synthetic CDC events with `op=r` (read/snapshot type), loaded directly to Bronze with a synthetic `cdc_ts_ms` in the gap window.
+3. **Silver recovery**: Because `APPLY CHANGES INTO` uses `sequence_by = cdc_ts_ms`, the backfilled batch events naturally merged into the correct state — no data corruption.
+4. **Root cause**: Debezium's Kafka Connect task had silently failed due to a Kafka broker rolling restart. The connector health check was not alerting.
+5. **Prevention implemented**:
+   - Extended MySQL binlog retention to **14 days**
+   - Added Kafka consumer lag monitoring with PagerDuty alert at **lag > 500K messages**
+   - Added Debezium connector status monitoring (REST API polling every 60s)
+   - Implemented a **binlog position heartbeat**: a scheduled MySQL write every 5 minutes to a heartbeat table → generates constant CDC events → if Bronze stops receiving heartbeats for >10 minutes, alert fires
+
+**Result:**  
+- Gap recovered in **2.5 hours** with zero downstream impact to dashboards
+- Recurrence: **zero binlog gap incidents** in 18 months after fixes
+- Monitoring stack now detects connector failures within **3 minutes**
+
+---
+
+### STAR #3: "How did you handle a design trade-off in a data pipeline?"
+
+**Situation:**  
+We needed to support GDPR right-to-erasure requests on our CDC pipeline. Bronze tables held every historical change event — including PII (email, phone, address) for deleted customers. Deleting from Bronze (immutable append-only log) while maintaining the audit trail for compliance was a fundamental conflict.
+
+**Task:**  
+Design a solution that satisfies GDPR deletion requirements without destroying the audit value of the Bronze layer and without impacting the Silver layer's latency.
+
+**Action:**  
+I evaluated three options:
+1. **Delete rows from Bronze directly** → Breaks Bronze immutability; Delta VACUUM would be required for every erasure request; operationally complex
+2. **Encrypt PII at ingest with per-customer key; delete key on erasure** → Elegant ("crypto-shredding") but adds KMS dependency and key management complexity
+3. **Separate PII vault at source** → Strip PII before Bronze, store in dedicated encrypted vault table (separate DLT pipeline with tighter access control)
+
+Chose **Option 3** after evaluating:
+- Option 2 requires every reader to handle key-not-found gracefully — breaking the "simple Bronze" principle
+- Option 3 keeps Bronze completely PII-free — no erasure ever needed on Bronze
+- Vault table: separate Delta table, column-level encryption, Unity Catalog row-level security
+- Erasure: MERGE the vault table to NULL the customer's PII — one operation, immediate, auditable
+
+**Result:**  
+- GDPR erasure requests completed in **<5 minutes** (SLA was 72 hours)
+- Bronze tables remained immutable — zero schema or delete operations ever run on Bronze
+- Unity Catalog audit logs provided the erasure audit trail required by legal
+- Architecture approved by DPO (Data Protection Officer) and legal team
+
+---
+
+## 10. System Design Interview — How to Draw This on a Whiteboard
+
+```
+Step 1: Start with the problem
+  "MySQL is being overloaded by analytics queries.
+   Need real-time replication with <2min latency."
+
+Step 2: Establish the layers
+  Source → Transport → Processing → Storage → Serving
+
+Step 3: Fill in components
+  MySQL (binlog ROW format)
+    → Debezium (Kafka Connect CDC)
+    → Kafka (per-table topics, 7-day retention)
+    → DLT Bronze (raw CDC events, append-only)
+    → DLT Silver (current state, APPLY CHANGES INTO)
+    → Gold (aggregated, BI-ready)
+
+Step 4: Address the "hard parts"
+  - Exactly-once: sequence_by on cdc_ts_ms + Kafka offsets
+  - Out-of-order: sequence_by handles this
+  - Schema evolution: Delta + DLT auto-merge
+  - Deletes: APPLY CHANGES apply_as_deletes
+  - Failures: Kafka retention enables replay
+
+Step 5: Discuss trade-offs proactively
+  - Why not batch ETL? Latency too high (hourly vs 45 seconds)
+  - Why Kafka between Debezium and Databricks? Decoupling + buffering
+  - Why DLT vs custom Structured Streaming? 
+    DLT manages checkpoints, expectations, schema evolution automatically
+  - Why SCD Type 1 in silver? 
+    Current state for dashboards; history in gold if needed
+```
+
+---
+
+## 11. Key Numbers to Memorize for Interviews
+
+| Metric | Value |
+|---|---|
+| End-to-end latency | ~45 seconds (30s trigger + processing) |
+| MySQL load reduction | 94% |
+| Throughput | 2.5M CDC events/day (~29 events/second avg) |
+| Kafka retention | 7 days (binlog: 14 days) |
+| DLT trigger interval | 30 seconds |
+| Kafka partitions (orders) | 8 |
+| Bronze row count growth | Append-only — grows by every CDC event |
+| Silver row count | = MySQL table row count (current state mirror) |
+| Data quality target | 99.97% (quarantine rate < 0.03%) |
+| GDPR erasure SLA | < 5 minutes |
+| Recovery from binlog gap | < 3 hours |
+
+---
+
+## 12. End-to-End Monitoring — How to Know Everything Is Working
+
+```
+THE CORE QUESTION:
+  "How do you know the pipeline is healthy RIGHT NOW?"
+
+Answer requires monitoring at EVERY layer:
+  Layer 1: Debezium Connector (is it running? is it reading the binlog?)
+  Layer 2: Kafka Topics (are messages flowing? is consumer keeping up?)
+  Layer 3: DLT Pipeline (is Databricks consuming? are expectations passing?)
+  Layer 4: Data Reconciliation (does silver match MySQL row counts?)
+  Layer 5: Heartbeat (is the entire end-to-end path alive?)
+```
+
+---
+
+### 12.1 Layer 1 — Monitoring Debezium Connector
+
+Debezium exposes its health via the **Kafka Connect REST API**.
+
+#### Check Connector Status (Manual)
+```bash
+# Is the connector running?
+curl -s http://kafka-connect:8083/connectors/mysql-orders-connector/status | jq .
+
+# Healthy response:
+{
+  "name": "mysql-orders-connector",
+  "connector": { "state": "RUNNING", "worker_id": "connect-1:8083" },
+  "tasks": [
+    { "id": 0, "state": "RUNNING", "worker_id": "connect-1:8083" }
+  ],
+  "type": "source"
+}
+
+# FAILED response (trigger alert):
+{
+  "name": "mysql-orders-connector",
+  "connector": { "state": "FAILED", "worker_id": "connect-1:8083" },
+  "tasks": [
+    {
+      "id": 0,
+      "state": "FAILED",
+      "worker_id": "connect-1:8083",
+      "trace": "org.apache.kafka.connect.errors.ConnectException: 
+                Could not find first log file name in binary log index file"
+    }
+  ]
+}
+```
+
+#### Automated Connector Health Check Script
+```python
+# monitoring/check_debezium_health.py
+# Run this as a Databricks Job every 5 minutes
+
+import requests
+import json
+
+CONNECT_URL  = "http://kafka-connect:8083"
+CONNECTORS   = ["mysql-orders-connector", "mysql-users-connector", "mysql-products-connector"]
+ALERT_WEBHOOK = "https://hooks.slack.com/services/xxx"  # or PagerDuty
+
+def check_connector(name):
+    url = f"{CONNECT_URL}/connectors/{name}/status"
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    status = resp.json()
+    
+    connector_state = status["connector"]["state"]
+    task_states = [t["state"] for t in status["tasks"]]
+    
+    is_healthy = (connector_state == "RUNNING" and all(s == "RUNNING" for s in task_states))
+    
+    return {
+        "connector":        name,
+        "connector_state":  connector_state,
+        "task_states":      task_states,
+        "healthy":          is_healthy,
+        "error_trace":      status["tasks"][0].get("trace") if not is_healthy else None
+    }
+
+def restart_connector_if_failed(name):
+    """Auto-restart a FAILED connector — handles transient failures"""
+    url = f"{CONNECT_URL}/connectors/{name}/restart?includeTasks=true&onlyFailed=true"
+    resp = requests.post(url, timeout=10)
+    return resp.status_code == 204  # 204 = restarted successfully
+
+for connector in CONNECTORS:
+    result = check_connector(connector)
+    
+    if not result["healthy"]:
+        print(f"UNHEALTHY: {connector} — {result['error_trace'][:200]}")
+        
+        # Attempt auto-restart (handles transient Connect worker crashes)
+        restarted = restart_connector_if_failed(connector)
+        
+        if not restarted:
+            # Send PagerDuty / Slack alert
+            requests.post(ALERT_WEBHOOK, json={
+                "text": f":red_circle: Debezium connector FAILED: {connector}\n"
+                        f"Error: {result['error_trace'][:300]}\n"
+                        f"Auto-restart: {'SUCCESS' if restarted else 'FAILED — manual intervention needed'}"
+            })
+    else:
+        print(f"HEALTHY: {connector} | tasks: {result['task_states']}")
+```
+
+#### Key Debezium Metrics (JMX / Prometheus)
+```
+# Expose via JMX exporter on Kafka Connect pods → scrape with Prometheus
+
+Metric: debezium_mysql_connector_metrics_MilliSecondsSinceLastEvent
+  → How many ms since Debezium last read a binlog event
+  → Alert if > 60,000 ms (1 minute) and MySQL is not idle
+
+Metric: debezium_mysql_connector_metrics_TotalNumberOfEventsSeen
+  → Total binlog events processed since connector started
+  → Should be monotonically increasing; flat line = connector stalled
+
+Metric: debezium_mysql_connector_metrics_NumberOfEventsFiltered
+  → Events filtered out by table.include.list
+  → Sudden spike = schema change or unexpected traffic
+
+Metric: debezium_mysql_connector_metrics_SourceEventPosition
+  → {"file": "mysql-bin.000042", "pos": 1048576, "snapshot": "false"}
+  → Critical: compare this with MySQL's SHOW MASTER STATUS
+  → Large gap = connector is behind
+```
+
+#### Check Binlog Position Gap
+```bash
+# On MySQL: get current binlog position
+mysql -u root -p -e "SHOW MASTER STATUS\G"
+# Output:
+#   File: mysql-bin.000042
+#   Position: 9876543
+
+# From Debezium REST API: get connector's last committed position
+curl -s http://kafka-connect:8083/connectors/mysql-orders-connector/offsets | jq .
+# Output:
+# {
+#   "offsets": [{
+#     "partition": {"server": "prod_mysql"},
+#     "offset": {
+#       "file": "mysql-bin.000042",
+#       "pos": 9875000,   ← Debezium's position
+#       "snapshot": false
+#     }
+#   }]
+# }
+
+# Gap = 9876543 - 9875000 = 1543 bytes → healthy (near real-time)
+# Gap = 9876543 - 1000000 = 8876543 bytes → ALERT (connector is far behind)
+```
+
+---
+
+### 12.2 Layer 2 — Monitoring Kafka Topics
+
+#### Consumer Group Lag — The Most Important Kafka Metric
+
+**Consumer lag** = how many messages are in Kafka that DLT has NOT yet consumed.
+
+```
+Kafka topic: prod_mysql.ecommerce.orders
+  Partition 0: latest_offset=50000, consumer_offset=49800 → lag=200  ✓
+  Partition 1: latest_offset=48000, consumer_offset=47900 → lag=100  ✓
+  Partition 2: latest_offset=52000, consumer_offset=42000 → lag=10000 ← ALERT
+
+Total lag = 10300 messages
+```
+
+#### Check Lag with kafka-consumer-groups CLI
+```bash
+# Check lag for the DLT consumer group
+kafka-consumer-groups.sh \
+  --bootstrap-server broker1:9092 \
+  --describe \
+  --group dlt-mysql-cdc-consumer \
+  --command-config /etc/kafka/client.properties
+
+# Output:
+# GROUP                    TOPIC                              PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG    CONSUMER-ID
+# dlt-mysql-cdc-consumer   prod_mysql.ecommerce.orders        0          49800           50000           200    dlt-worker-1
+# dlt-mysql-cdc-consumer   prod_mysql.ecommerce.orders        1          47900           48000           100    dlt-worker-2
+# dlt-mysql-cdc-consumer   prod_mysql.ecommerce.orders        2          42000           52000           10000  dlt-worker-3  ← ALERT
+```
+
+#### Python Script: Check Lag Programmatically
+```python
+# monitoring/check_kafka_lag.py
+from confluent_kafka.admin import AdminClient
+from confluent_kafka import Consumer, TopicPartition
+
+BOOTSTRAP   = "broker1:9092,broker2:9092"
+GROUP_ID    = "dlt-mysql-cdc-consumer"
+TOPICS      = [
+    "prod_mysql.ecommerce.orders",
+    "prod_mysql.ecommerce.users",
+    "prod_mysql.ecommerce.products"
+]
+LAG_ALERT_THRESHOLD = 5000   # alert if any partition is 5000+ messages behind
+
+admin = AdminClient({"bootstrap.servers": BOOTSTRAP})
+consumer = Consumer({
+    "bootstrap.servers": BOOTSTRAP,
+    "group.id":          GROUP_ID + "-monitor",   # separate group, read-only
+    "enable.auto.commit": False
+})
+
+def get_partition_lag(topic):
+    # Get partition metadata
+    metadata = admin.list_topics(topic=topic, timeout=10)
+    partitions = list(metadata.topics[topic].partitions.keys())
+    
+    tps = [TopicPartition(topic, p) for p in partitions]
+    
+    # Get consumer group committed offsets
+    committed = consumer.committed(tps, timeout=10)
+    
+    # Get latest (end) offsets
+    high_watermarks = {}
+    consumer.assign(tps)
+    end_offsets = consumer.get_watermark_offsets
+    
+    results = []
+    for tp in tps:
+        committed_offset = tp.offset if tp.offset >= 0 else 0
+        # Get end offset for this partition
+        low, high = consumer.get_watermark_offsets(tp, timeout=5)
+        lag = high - committed_offset
+        results.append({
+            "topic":     topic,
+            "partition": tp.partition,
+            "committed": committed_offset,
+            "end":       high,
+            "lag":       lag,
+            "status":    "ALERT" if lag > LAG_ALERT_THRESHOLD else "OK"
+        })
+    return results
+
+for topic in TOPICS:
+    lags = get_partition_lag(topic)
+    for row in lags:
+        status_icon = "🔴" if row["status"] == "ALERT" else "🟢"
+        print(f"{status_icon} {row['topic']} P{row['partition']} | "
+              f"committed={row['committed']:,} | end={row['end']:,} | lag={row['lag']:,}")
+
+consumer.close()
+```
+
+#### Verify Messages Are Actually Flowing (Not Just Offset Movement)
+```bash
+# Consume a sample of latest messages and inspect them
+kafka-console-consumer.sh \
+  --bootstrap-server broker1:9092 \
+  --topic prod_mysql.ecommerce.orders \
+  --from-beginning \
+  --max-messages 5 \
+  --property print.timestamp=true \
+  --property print.offset=true \
+  | jq '{offset: .offset, ts: .timestamp, op: .payload.op, id: .payload.after.id}'
+
+# Expected output — messages arriving within the last 30 seconds:
+# {"offset": 49995, "ts": 1716912000123, "op": "u", "id": 10042}
+# {"offset": 49996, "ts": 1716912000456, "op": "c", "id": 10043}
+# {"offset": 49997, "ts": 1716912001000, "op": "u", "id": 10041}
+
+# RED FLAG: Last message timestamp is > 5 minutes ago but MySQL has activity
+#           → Debezium has stopped producing
+```
+
+#### Kafka Topic Throughput — Messages/Second
+```bash
+# Watch throughput in real time
+kafka-consumer-groups.sh \
+  --bootstrap-server broker1:9092 \
+  --describe \
+  --group dlt-mysql-cdc-consumer \
+  | watch -n 5   # refresh every 5 seconds
+
+# Calculate throughput:
+# t=0:  total_lag = 10000
+# t=5s: total_lag = 9800
+# messages_consumed_in_5s = 200  →  40 msg/sec
+```
+
+---
+
+### 12.3 Layer 3 — Monitoring Databricks DLT Pipeline
+
+#### DLT Event Log — The Built-in Audit Trail
+```sql
+-- DLT writes structured events to an internal event log
+-- Query it from the pipeline's event log location
+
+SELECT
+  timestamp,
+  event_type,      -- 'update_progress', 'flow_progress', 'create_table', 'expectations'
+  level,           -- 'INFO', 'WARN', 'ERROR'
+  message,
+  details
+FROM delta.`/pipelines/<pipeline_id>/system/events`
+WHERE timestamp > current_timestamp() - INTERVAL 1 HOUR
+ORDER BY timestamp DESC
+LIMIT 50;
+```
+
+#### Check DLT Expectations (Data Quality)
+```sql
+-- How many records were quarantined vs passed?
+SELECT
+  timestamp,
+  details:flow_name                                        AS flow_name,
+  details:expectations[0].name                            AS expectation_name,
+  details:expectations[0].passed_records                  AS passed,
+  details:expectations[0].failed_records                  AS failed,
+  ROUND(details:expectations[0].failed_records * 100.0 /
+    NULLIF(details:expectations[0].passed_records +
+           details:expectations[0].failed_records, 0), 2) AS failure_pct
+FROM delta.`/pipelines/<pipeline_id>/system/events`
+WHERE event_type = 'flow_progress'
+  AND details:expectations IS NOT NULL
+  AND timestamp > current_timestamp() - INTERVAL 24 HOURS
+ORDER BY timestamp DESC;
+
+-- RED FLAG: failure_pct > 1% → schema change or data quality issue upstream
+```
+
+#### DLT Batch Progress — Is It Processing?
+```sql
+-- Check how many rows each DLT update processed
+SELECT
+  timestamp,
+  details:flow_name                        AS table_name,
+  details:output_dataset                   AS output_table,
+  details:num_output_rows                  AS rows_written,
+  details:batch_id                         AS batch_id,
+  datediff(second,
+    LAG(timestamp) OVER (
+      PARTITION BY details:flow_name ORDER BY timestamp
+    ),
+    timestamp)                             AS seconds_since_last_batch
+FROM delta.`/pipelines/<pipeline_id>/system/events`
+WHERE event_type = 'flow_progress'
+  AND details:status = 'COMPLETED'
+ORDER BY timestamp DESC;
+
+-- RED FLAG: seconds_since_last_batch > 120 (DLT trigger = 30s → normal gap = 30-60s)
+-- If gap > 120s → DLT may be stalled, cluster scaling issue, or Kafka is empty
+```
+
+#### Using Databricks REST API to Check Pipeline Status
+```python
+# monitoring/check_dlt_status.py
+import requests
+
+DATABRICKS_HOST  = "https://adb-xxxx.azuredatabricks.net"
+TOKEN            = "dapiXXXXXXXX"  # from secret store, never hardcode
+PIPELINE_ID      = "12345678-abcd-1234-efgh-123456789abc"
+
+headers = {"Authorization": f"Bearer {TOKEN}"}
+
+# Get latest pipeline update status
+resp = requests.get(
+    f"{DATABRICKS_HOST}/api/2.0/pipelines/{PIPELINE_ID}",
+    headers=headers
+)
+pipeline = resp.json()
+
+state = pipeline["state"]           # RUNNING, IDLE, FAILED, STOPPING
+latest_update = pipeline.get("latest_updates", [{}])[0]
+update_state  = latest_update.get("state", "UNKNOWN")  # COMPLETED, FAILED, RUNNING
+
+print(f"Pipeline state : {state}")
+print(f"Latest update  : {update_state}")
+
+if state == "FAILED" or update_state == "FAILED":
+    cause = latest_update.get("cause", "Unknown cause")
+    print(f"FAILURE REASON : {cause}")
+    # Trigger PagerDuty alert here
+```
+
+---
+
+### 12.4 Layer 4 — Data Reconciliation (Row Count Verification)
+
+This is how you verify **no records are missing** between MySQL and Silver.
+
+#### Hourly Reconciliation Job
+```python
+# monitoring/reconcile_mysql_vs_silver.py
+# Run every hour as a Databricks Job
+
+import mysql.connector
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+
+# ── Step 1: Get counts from MySQL (source of truth) ──────────────────────────
+mysql_conn = mysql.connector.connect(
+    host     = dbutils.secrets.get("mysql", "host"),
+    user     = dbutils.secrets.get("mysql", "user"),
+    password = dbutils.secrets.get("mysql", "password"),
+    database = "ecommerce"
+)
+cursor = mysql_conn.cursor()
+
+# Total count
+cursor.execute("SELECT COUNT(*) FROM orders")
+mysql_total = cursor.fetchone()[0]
+
+# Count of orders modified in last hour (what should have arrived via CDC)
+cursor.execute("""
+    SELECT COUNT(*)
+    FROM orders
+    WHERE updated_at >= NOW() - INTERVAL 1 HOUR
+""")
+mysql_recent = cursor.fetchone()[0]
+
+# Max primary key (watermark check)
+cursor.execute("SELECT MAX(id) FROM orders")
+mysql_max_id = cursor.fetchone()[0]
+
+mysql_conn.close()
+
+# ── Step 2: Get counts from Silver (lakehouse) ───────────────────────────────
+silver_total    = spark.table("prod_catalog.ecommerce.silver_orders").count()
+silver_max_id   = spark.sql("SELECT MAX(order_id) FROM prod_catalog.ecommerce.silver_orders") \
+                       .collect()[0][0]
+silver_recent   = spark.sql("""
+    SELECT COUNT(*) 
+    FROM prod_catalog.ecommerce.silver_orders
+    WHERE source_updated_at_ms >= UNIX_TIMESTAMP(NOW() - INTERVAL 1 HOUR) * 1000
+""").collect()[0][0]
+
+# ── Step 3: Compare and alert ─────────────────────────────────────────────────
+total_diff  = abs(mysql_total  - silver_total)
+max_id_diff = abs(mysql_max_id - silver_max_id)
+
+print(f"MySQL total rows    : {mysql_total:,}")
+print(f"Silver total rows   : {silver_total:,}")
+print(f"Difference (total)  : {total_diff:,}")
+print()
+print(f"MySQL max order_id  : {mysql_max_id:,}")
+print(f"Silver max order_id : {silver_max_id:,}")
+print(f"Max ID gap          : {max_id_diff:,}")
+print()
+print(f"MySQL recent (1h)   : {mysql_recent:,}")
+print(f"Silver recent (1h)  : {silver_recent:,}")
+
+# Alert thresholds
+if total_diff > 100:
+    raise Exception(
+        f"RECONCILIATION FAILURE: {total_diff:,} rows missing in Silver. "
+        f"MySQL={mysql_total:,}, Silver={silver_total:,}"
+    )
+if max_id_diff > 10:
+    raise Exception(
+        f"RECONCILIATION FAILURE: Silver missing recent IDs. "
+        f"MySQL max_id={mysql_max_id}, Silver max_id={silver_max_id}"
+    )
+
+print("✓ Reconciliation PASSED")
+```
+
+#### Write Reconciliation Results to a Monitoring Table
+```python
+# Log results to a Delta table for trending
+from datetime import datetime
+
+rec_data = [{
+    "check_ts":          datetime.utcnow().isoformat(),
+    "table_name":        "orders",
+    "mysql_count":       mysql_total,
+    "silver_count":      silver_total,
+    "count_diff":        total_diff,
+    "mysql_max_id":      mysql_max_id,
+    "silver_max_id":     silver_max_id,
+    "id_gap":            max_id_diff,
+    "mysql_recent_1h":   mysql_recent,
+    "silver_recent_1h":  silver_recent,
+    "status":            "PASS" if total_diff <= 100 else "FAIL"
+}]
+
+rec_df = spark.createDataFrame(rec_data)
+rec_df.write.format("delta").mode("append").saveAsTable(
+    "prod_catalog.monitoring.cdc_reconciliation_results"
+)
+
+# Dashboard query: trend of count differences over time
+spark.sql("""
+    SELECT DATE(check_ts) AS date,
+           table_name,
+           AVG(count_diff) AS avg_diff,
+           MAX(count_diff) AS max_diff,
+           SUM(CASE WHEN status='FAIL' THEN 1 ELSE 0 END) AS failures
+    FROM prod_catalog.monitoring.cdc_reconciliation_results
+    WHERE check_ts > current_timestamp() - INTERVAL 7 DAYS
+    GROUP BY DATE(check_ts), table_name
+    ORDER BY date DESC
+""").show()
+```
+
+---
+
+### 12.5 Layer 5 — Heartbeat Pattern (End-to-End Liveness Test)
+
+The heartbeat is a **canary record** that flows through the entire pipeline every N minutes.  
+If the heartbeat stops arriving at Silver within the expected window → the pipeline is stalled.
+
+```
+             Every 5 minutes:
+MySQL ──────────────────────────────────────────────────────────►
+  INSERT INTO heartbeat (id, pulse_ts)
+  VALUES (1, NOW())
+  ON DUPLICATE KEY UPDATE pulse_ts = NOW();
+        │
+        ▼ (Debezium captures the UPDATE)
+Kafka ──────────────────────────────────────────────────────────►
+  prod_mysql.ecommerce.heartbeat topic
+  message: {"op":"u", "after": {"id":1, "pulse_ts": 1716912300000}}
+        │
+        ▼ (DLT Bronze → Silver)
+Silver heartbeat table ────────────────────────────────────────►
+  SELECT MAX(pulse_ts) FROM silver_heartbeat
+  → If MAX(pulse_ts) < NOW() - 5 minutes → ALERT: pipeline is stalled
+```
+
+#### MySQL Setup
+```sql
+-- Create heartbeat table in MySQL
+CREATE TABLE ecommerce.heartbeat (
+    id         INT PRIMARY KEY DEFAULT 1,
+    pulse_ts   TIMESTAMP NOT NULL,
+    hostname   VARCHAR(100)
+);
+
+INSERT INTO ecommerce.heartbeat (id, pulse_ts, hostname)
+VALUES (1, NOW(), @@hostname);
+```
+
+#### Heartbeat Writer Job (runs every 5 minutes)
+```python
+# monitoring/heartbeat_writer.py
+# Schedule as a MySQL cron job or external scheduler
+
+import mysql.connector
+import schedule
+import time
+
+def write_heartbeat():
+    conn = mysql.connector.connect(
+        host=MYSQL_HOST, user=MYSQL_USER, password=MYSQL_PASS, database="ecommerce"
+    )
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO heartbeat (id, pulse_ts, hostname)
+        VALUES (1, NOW(), @@hostname)
+        ON DUPLICATE KEY UPDATE pulse_ts = NOW(), hostname = @@hostname
+    """)
+    conn.commit()
+    conn.close()
+    print(f"Heartbeat written at {time.strftime('%H:%M:%S')}")
+
+schedule.every(5).minutes.do(write_heartbeat)
+while True:
+    schedule.run_pending()
+    time.sleep(1)
+```
+
+#### Heartbeat DLT Table
+```python
+# In the DLT pipeline — add a heartbeat table alongside bronze/silver
+
+@dlt.table(name="bronze_heartbeat")
+def bronze_heartbeat():
+    return (
+        spark.readStream
+            .format("kafka")
+            .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+            .option("subscribe", "prod_mysql.ecommerce.heartbeat")
+            .option("startingOffsets", "latest")
+            .load()
+            .select(
+                F.get_json_object(F.col("value").cast("string"),
+                    "$.payload.after.pulse_ts").cast("long").alias("pulse_ts_ms"),
+                F.current_timestamp().alias("arrived_at"),
+                F.col("timestamp").alias("kafka_ts")
+            )
+    )
+
+dlt.create_streaming_table("silver_heartbeat")
+dlt.apply_changes(
+    target     = "silver_heartbeat",
+    source     = "bronze_heartbeat",
+    keys       = [F.lit(1).alias("id")],  # singleton row
+    sequence_by = F.col("pulse_ts_ms")
+)
+```
+
+#### Heartbeat Checker Job (runs every 1 minute)
+```python
+# monitoring/check_heartbeat.py
+from datetime import datetime, timedelta
+
+heartbeat_row = spark.sql("""
+    SELECT 
+        pulse_ts_ms,
+        arrived_at,
+        current_timestamp()                         AS checked_at,
+        datediff(second, arrived_at, 
+                 current_timestamp())               AS seconds_since_arrival,
+        datediff(second,
+            timestamp_millis(pulse_ts_ms),
+            current_timestamp())                    AS seconds_since_mysql_write
+    FROM prod_catalog.ecommerce.silver_heartbeat
+""").first()
+
+print(f"Last heartbeat MySQL write  : {heartbeat_row['seconds_since_mysql_write']}s ago")
+print(f"Last heartbeat arrived DLT  : {heartbeat_row['seconds_since_arrival']}s ago")
+
+# Alert conditions:
+if heartbeat_row["seconds_since_mysql_write"] > 300:   # 5 minutes
+    alert("CRITICAL: MySQL heartbeat not being written — MySQL or heartbeat job is down")
+
+elif heartbeat_row["seconds_since_arrival"] > 180:     # 3 minutes
+    alert("CRITICAL: Heartbeat not arriving in Silver — Debezium/Kafka/DLT pipeline is stalled")
+
+elif heartbeat_row["seconds_since_arrival"] > 90:      # 90 seconds (SLA = 45s normal)
+    alert("WARNING: Heartbeat latency elevated — pipeline may be slow")
+
+else:
+    print(f"✓ Pipeline is LIVE. End-to-end latency: {heartbeat_row['seconds_since_arrival']}s")
+```
+
+---
+
+### 12.6 Unified Monitoring Dashboard
+
+All five layers feed into a single Databricks SQL Dashboard:
+
+```sql
+-- Dashboard Query 1: Pipeline Health Summary (refresh every 1 min)
+SELECT
+    'Debezium'    AS component,
+    CASE WHEN debezium_lag_seconds < 60   THEN 'HEALTHY'
+         WHEN debezium_lag_seconds < 300  THEN 'WARNING'
+         ELSE                                  'CRITICAL' END AS status,
+    debezium_lag_seconds || 's behind binlog'  AS detail
+FROM monitoring.debezium_metrics
+WHERE ts = (SELECT MAX(ts) FROM monitoring.debezium_metrics)
+
+UNION ALL
+
+SELECT
+    'Kafka Lag'   AS component,
+    CASE WHEN max_partition_lag < 1000   THEN 'HEALTHY'
+         WHEN max_partition_lag < 5000   THEN 'WARNING'
+         ELSE                                 'CRITICAL' END AS status,
+    max_partition_lag || ' messages behind'    AS detail
+FROM monitoring.kafka_lag
+WHERE ts = (SELECT MAX(ts) FROM monitoring.kafka_lag)
+
+UNION ALL
+
+SELECT
+    'DLT Pipeline'  AS component,
+    CASE WHEN seconds_since_last_batch < 90  THEN 'HEALTHY'
+         WHEN seconds_since_last_batch < 180 THEN 'WARNING'
+         ELSE                                     'CRITICAL' END AS status,
+    seconds_since_last_batch || 's since last batch' AS detail
+FROM monitoring.dlt_batch_stats
+WHERE ts = (SELECT MAX(ts) FROM monitoring.dlt_batch_stats)
+
+UNION ALL
+
+SELECT
+    'Heartbeat'   AS component,
+    CASE WHEN seconds_since_arrival < 90   THEN 'HEALTHY'
+         WHEN seconds_since_arrival < 180  THEN 'WARNING'
+         ELSE                                   'CRITICAL' END AS status,
+    seconds_since_arrival || 's since last heartbeat' AS detail
+FROM monitoring.heartbeat_status
+
+UNION ALL
+
+SELECT
+    'Reconciliation' AS component,
+    CASE WHEN count_diff <= 10   THEN 'HEALTHY'
+         WHEN count_diff <= 100  THEN 'WARNING'
+         ELSE                         'CRITICAL' END AS status,
+    count_diff || ' rows missing in Silver' AS detail
+FROM monitoring.cdc_reconciliation_results
+WHERE check_ts = (SELECT MAX(check_ts) FROM monitoring.cdc_reconciliation_results);
+```
+
+---
+
+### 12.7 Complete Alert Runbook
+
+| Alert | Meaning | Immediate Action | Root Cause Checklist |
+|---|---|---|---|
+| Debezium connector FAILED | Connector crashed | Auto-restart via REST API | 1. Check error trace 2. Binlog expired? 3. MySQL network? |
+| Binlog gap > 6 days | Risk of offset expiry | Increase MySQL retention immediately | Set expire_logs_days = 14 |
+| Kafka lag > 5,000 | DLT is behind | Check DLT pipeline state | 1. DLT running? 2. Kafka backpressure? 3. Compute scale-up? |
+| No Kafka messages for 10 min | Debezium stopped producing | Check Debezium connector status | 1. MySQL activity idle? 2. Connector FAILED? |
+| DLT batch gap > 3 min | DLT stalled | Check pipeline UI for errors | 1. Cluster crashed? 2. Kafka unreachable? 3. OOM? |
+| Heartbeat > 3 min old | Full pipeline stall | Page on-call engineer | Work through layers 1→5 in order |
+| Reconciliation diff > 100 | Missing records | Do not restart blindly | 1. Check quarantine table 2. Check Bronze count vs Silver 3. Check sequence_by collisions |
+| DLT expectation failure > 1% | Schema change or bad data | Check quarantine table | 1. New MySQL column? 2. Data type change? 3. Null constraint violation? |
+
+---
+
+### 12.8 Quick Diagnostic Commands — "Is It Working Right Now?"
+
+```bash
+# ── 1. Is Debezium alive? ─────────────────────────────────────────────────────
+curl -s http://kafka-connect:8083/connectors/mysql-orders-connector/status \
+  | jq '.connector.state, .tasks[].state'
+# Expected: "RUNNING" "RUNNING"
+
+# ── 2. What is the binlog lag? ───────────────────────────────────────────────
+# MySQL current position:
+mysql -e "SHOW MASTER STATUS\G" | grep -E "File|Position"
+# Debezium committed position:
+curl -s http://kafka-connect:8083/connectors/mysql-orders-connector/offsets \
+  | jq '.offsets[0].offset'
+
+# ── 3. Is Kafka getting messages? ────────────────────────────────────────────
+kafka-console-consumer.sh \
+  --bootstrap-server broker1:9092 \
+  --topic prod_mysql.ecommerce.orders \
+  --max-messages 1 \
+  --timeout-ms 10000
+# If timeout with no message: Debezium stopped or MySQL is completely idle
+
+# ── 4. What is the consumer lag? ─────────────────────────────────────────────
+kafka-consumer-groups.sh \
+  --bootstrap-server broker1:9092 \
+  --describe \
+  --group dlt-mysql-cdc-consumer \
+  | awk '{print $6}' | tail -n +2 | paste -sd+ | bc
+# Prints total lag across all partitions
+
+# ── 5. Is DLT processing? ────────────────────────────────────────────────────
+# Databricks CLI:
+databricks pipelines get --pipeline-id <id> | jq '.state, .latest_updates[0].state'
+# Expected: "RUNNING" "COMPLETED"
+
+# ── 6. What's the heartbeat latency? ─────────────────────────────────────────
+# In Databricks notebook or SQL:
+SELECT datediff(second, arrived_at, current_timestamp()) AS latency_seconds
+FROM prod_catalog.ecommerce.silver_heartbeat;
+# Expected: < 90 seconds
+
+# ── 7. Does Silver match MySQL? ───────────────────────────────────────────────
+# Quick sanity check:
+SELECT COUNT(*) FROM prod_catalog.ecommerce.silver_orders;
+# Compare to: mysql -e "SELECT COUNT(*) FROM ecommerce.orders"
+```
